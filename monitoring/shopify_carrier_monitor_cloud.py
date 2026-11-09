@@ -40,6 +40,9 @@ EXPECTED_RATE_NAME = os.getenv("EXPECTED_RATE_NAME", "Free Shipping + $2.25 Ship
 EXPECTED_RATE_AMOUNT = os.getenv("EXPECTED_RATE_AMOUNT", "$2.25")
 EXPECTED_CURRENCY = os.getenv("EXPECTED_CURRENCY", "USD")
 
+# Radio labels on the checkout page that are not shipping rates.
+NON_SHIPPING_LABELS = ("Same as shipping address", "Use a different billing address")
+
 ARTIFACT_DIR = Path(os.getenv("ARTIFACT_DIR", "artifacts"))
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -120,13 +123,17 @@ def wait_for_shipping_rates_on_page(page, timeout_ms: int = 35000) -> None:
         "input[type='radio']:visible, [role='radio']:visible",
         timeout=timeout_ms,
     )
-    # Shopify first renders skeleton radios while the carrier service
-    # responds; wait until at least one option has a real label.
+    # Shopify first renders grey placeholder rows while the carrier service
+    # responds. The billing-address radios are labelled from the start, so
+    # wait for a labelled radio that is not one of those.
     page.wait_for_function(
-        """() => [...document.querySelectorAll("input[type='radio']")].some(el => {
+        """(skip) => [...document.querySelectorAll("input[type='radio']")].some(el => {
             const lb = (el.labels && el.labels[0]) || el.closest('label');
-            return lb && lb.offsetParent && lb.innerText.trim().length > 0;
+            if (!lb || !lb.offsetParent) return false;
+            const t = lb.innerText.trim().toLowerCase();
+            return t.length > 0 && !skip.includes(t);
         })""",
+        arg=[t.lower() for t in NON_SHIPPING_LABELS],
         timeout=timeout_ms,
     )
 
@@ -149,7 +156,7 @@ def collect_visible_shipping_labels(page) -> list[str]:
                     }"""
                 )
                 t = (t or "").strip()
-                if t and t not in lines:
+                if t and t not in lines and t not in NON_SHIPPING_LABELS:
                     lines.append(t)
             except Exception:
                 pass
@@ -425,6 +432,11 @@ def run_once(browser, run_number: int) -> dict:
         screenshot = ARTIFACT_DIR / f"FAIL_{run_number}.png"
         if page:
             try:
+                if "verify you are human" in page.locator("body").inner_text(timeout=3000).lower():
+                    result["error"] = "Blocked by Cloudflare bot check. " + result["error"]
+            except Exception:
+                pass
+            try:
                 if not result["shipping_options"]:
                     result["shipping_options"] = collect_visible_shipping_labels(page)
                 page.screenshot(path=str(screenshot), full_page=True)
@@ -468,7 +480,8 @@ def main() -> int:
                     )
 
                 if run < NUM_RUNS:
-                    time.sleep(DELAY_BETWEEN_RUNS_SEC)
+                    # Vary the gap so the traffic looks less like a bot.
+                    time.sleep(DELAY_BETWEEN_RUNS_SEC * random.uniform(0.8, 1.2))
         finally:
             browser.close()
 
