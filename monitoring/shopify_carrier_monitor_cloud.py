@@ -43,6 +43,18 @@ EXPECTED_CURRENCY = os.getenv("EXPECTED_CURRENCY", "USD")
 # Radio labels on the checkout page that are not shipping rates.
 NON_SHIPPING_LABELS = ("Same as shipping address", "Use a different billing address")
 
+# A run passes only if at least this many checkouts actually reached the
+# shipping rates and saw the expected one. Checkouts stopped by a bot check
+# are reported as BLOCKED and don't count either way.
+MIN_VERIFIED = int(os.getenv("MIN_VERIFIED", "3"))
+
+# Text shown by Shopify's and Cloudflare's bot-check interstitials.
+BOT_CHECK_TEXTS = ("verifying your browser", "verify your browser", "verify you are human")
+
+
+class BotCheckBlocked(Exception):
+    """The storefront served a bot-check page instead of the real page."""
+
 ARTIFACT_DIR = Path(os.getenv("ARTIFACT_DIR", "artifacts"))
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -96,6 +108,25 @@ def unlock_storefront(page) -> None:
     page.wait_for_timeout(1000)
     if "/password" in urlparse(page.url).path:
         raise AssertionError("Storefront password was rejected.")
+
+
+def bot_check_shown(page) -> bool:
+    """True if the page is a Shopify/Cloudflare bot-check interstitial.
+
+    The monitor does not try to get past these; it only reports them.
+    """
+    try:
+        if any("challenges.cloudflare.com" in (f.url or "") for f in page.frames):
+            return True
+        text = (page.title() + " " + page.locator("body").inner_text(timeout=3000)).lower()
+        return any(t in text for t in BOT_CHECK_TEXTS)
+    except Exception:
+        return False
+
+
+def raise_if_bot_check(page) -> None:
+    if bot_check_shown(page):
+        raise BotCheckBlocked("Blocked by bot check (Shopify/Cloudflare 'verify your browser' page).")
 
 
 def fill_once(page, selectors: list[str], value: str) -> None:
@@ -227,12 +258,14 @@ def run_once(browser, run_number: int) -> dict:
             f"{COLLECTION_BASE}?page={page_num}",
             wait_until="domcontentloaded",
         )
+        raise_if_bot_check(page)
         unlock_storefront(page)
         if "/collections/all" not in page.url:
             page.goto(
                 f"{COLLECTION_BASE}?page={page_num}",
                 wait_until="domcontentloaded",
             )
+            raise_if_bot_check(page)
         page.wait_for_selector(
             "a[href*='/products/']",
             state="attached",
@@ -267,6 +300,7 @@ def run_once(browser, run_number: int) -> dict:
         result["stage"] = "open_product"
         page.goto(product_url, wait_until="domcontentloaded")
         page.wait_for_timeout(1500)
+        raise_if_bot_check(page)
         time.sleep(STEP_DELAY_SEC)
 
         # 3. Add to cart.
@@ -279,6 +313,7 @@ def run_once(browser, run_number: int) -> dict:
         result["stage"] = "open_checkout"
         page.goto(f"{STORE_BASE}/checkout", wait_until="domcontentloaded")
         time.sleep(STEP_DELAY_SEC)
+        raise_if_bot_check(page)
 
         page.wait_for_selector(
             "input[name='email'], input#email, "
@@ -429,13 +464,13 @@ def run_once(browser, run_number: int) -> dict:
 
     except Exception as exc:
         result["error"] = str(exc).splitlines()[0][:500]
-        screenshot = ARTIFACT_DIR / f"FAIL_{run_number}.png"
+        # A timeout can also be a bot-check page that loaded late.
+        if isinstance(exc, BotCheckBlocked) or (page and bot_check_shown(page)):
+            result["status"] = "BLOCKED"
+            if not isinstance(exc, BotCheckBlocked):
+                result["error"] = "Blocked by bot check. " + result["error"]
+        screenshot = ARTIFACT_DIR / f"{result['status']}_{run_number}.png"
         if page:
-            try:
-                if "verify you are human" in page.locator("body").inner_text(timeout=3000).lower():
-                    result["error"] = "Blocked by Cloudflare bot check. " + result["error"]
-            except Exception:
-                pass
             try:
                 if not result["shipping_options"]:
                     result["shipping_options"] = collect_visible_shipping_labels(page)
@@ -473,9 +508,9 @@ def main() -> int:
             for run in range(1, NUM_RUNS + 1):
                 result = run_once(browser, run)
                 results.append(result)
-                if result["status"] == "FAIL":
+                if result["status"] != "PASS":
                     print(
-                        f"  FAIL run {run} at stage '{result['stage']}': "
+                        f"  {result['status']} run {run} at stage '{result['stage']}': "
                         f"{result['error']}"
                     )
 
@@ -485,29 +520,42 @@ def main() -> int:
         finally:
             browser.close()
 
+    passed = sum(r["status"] == "PASS" for r in results)
     failures = sum(r["status"] == "FAIL" for r in results)
+    blocked = sum(r["status"] == "BLOCKED" for r in results)
+    if failures:
+        overall = "FAIL"
+    elif passed >= MIN_VERIFIED:
+        overall = "PASS"
+    else:
+        overall = "INCONCLUSIVE"
     summary = {
         "timestamp": started,
         "store": STORE_BASE,
         "runs": NUM_RUNS,
-        "passed": NUM_RUNS - failures,
+        "passed": passed,
         "failed": failures,
+        "blocked": blocked,
+        "min_verified": MIN_VERIFIED,
         "expected_carrier": EXPECTED_RATE_NAME,
         "expected_rate": f"{EXPECTED_RATE_AMOUNT} {EXPECTED_CURRENCY}",
-        "result": "FAIL" if failures else "PASS",
+        "result": overall,
         "details": results,
     }
     summary_path = ARTIFACT_DIR / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))
     print("SUMMARY_JSON " + json.dumps(summary))
 
-    if failures:
-        print(
-            f"RESULT: FAIL — {failures}/{NUM_RUNS} run(s) failed"
-        )
+    counts = f"{passed} passed, {failures} failed, {blocked} blocked by bot check (of {NUM_RUNS})"
+    if overall == "FAIL":
+        print(f"RESULT: FAIL — {counts}")
+        return 1
+    if overall == "INCONCLUSIVE":
+        print(f"RESULT: INCONCLUSIVE — only {passed} checkout(s) reached the rates "
+              f"(need {MIN_VERIFIED}); {counts}")
         return 1
 
-    print(f"RESULT: PASS — {NUM_RUNS}/{NUM_RUNS} run(s) passed")
+    print(f"RESULT: PASS — {counts}")
     return 0
 
 

@@ -55,7 +55,8 @@ jobs:
               print("## FAIL - monitor did not produce summary.json")
               raise SystemExit
           s = json.loads(p.read_text())
-          print(f"## {s['result']} - {s['passed']}/{s['runs']} passed")
+          print(f"## {s['result']} - {s['passed']}/{s['runs']} passed, "
+                f"{s.get('failed', 0)} failed, {s.get('blocked', 0)} blocked by bot check")
           print(f"- **Timestamp:** {s['timestamp']}")
           print(f"- **Expected:** {s['expected_carrier']} / {s['expected_rate']}")
           print()
