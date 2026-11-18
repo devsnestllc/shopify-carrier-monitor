@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   monitor:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # ubuntu-latest moved to 26.04, which Playwright 1.56 cannot install Chromium on
     # 20 checkouts with ~75 s gaps take about 45 minutes.
     timeout-minutes: 55
     steps:
